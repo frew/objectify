@@ -15,6 +15,7 @@ import glide.api.models.configuration.RequestRoutingConfiguration.SlotType;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -25,6 +26,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -81,6 +83,22 @@ import static glide.api.models.GlideString.gs;
  */
 public class ValkeyCacheService implements MemcacheService {
 
+	/**
+	 * Wraps the raw bytes of a stored value in the {@link ObjectInputStream} used to deserialize it.
+	 * The default is a plain {@link ObjectInputStream}, which resolves classes by their exact stored
+	 * name. Callers that need something else — most commonly a subclass overriding
+	 * {@link ObjectInputStream#resolveClass} to map class names written by a differently-built process,
+	 * such as one whose dependencies were relocated by a shading step — can supply their own. That lets
+	 * processes with different relocation schemes share a single cache instead of each needing its own.
+	 *
+	 * <p>Kept as an explicit interface rather than a {@code Function<InputStream, ObjectInputStream>}
+	 * because the {@link ObjectInputStream} constructor throws {@link IOException}.</p>
+	 */
+	@FunctionalInterface
+	public interface ObjectInputStreamFactory {
+		ObjectInputStream create(InputStream in) throws IOException;
+	}
+
 	/** Single-byte sentinel for null. Cannot collide with Java-serialized data (which starts 0xAC 0xED). */
 	private static final byte[] NULL_VALUE = new byte[]{0};
 
@@ -124,17 +142,34 @@ public class ValkeyCacheService implements MemcacheService {
 	/** Cold-cache sentinel options: {@code NX} plus the default TTL. Pre-built for the same reason as {@link #defaultSetOptions}. */
 	private final SetOptions defaultNxSetOptions;
 
-	/** Uses {@link #DEFAULT_EXPIRATION_SECONDS} as the fallback TTL. */
+	/** Builds the {@link ObjectInputStream} used on the read path; see {@link ObjectInputStreamFactory}. */
+	private final ObjectInputStreamFactory objectInputStreamFactory;
+
+	/** Uses {@link #DEFAULT_EXPIRATION_SECONDS} as the fallback TTL and a plain {@link ObjectInputStream}. */
 	public ValkeyCacheService(final BaseClient client) {
 		this(client, DEFAULT_EXPIRATION_SECONDS);
 	}
 
+	/** Uses {@link #DEFAULT_EXPIRATION_SECONDS} as the fallback TTL. */
+	public ValkeyCacheService(final BaseClient client, final ObjectInputStreamFactory objectInputStreamFactory) {
+		this(client, DEFAULT_EXPIRATION_SECONDS, objectInputStreamFactory);
+	}
+
+	/** Uses a plain {@link ObjectInputStream} on the read path. */
 	public ValkeyCacheService(final BaseClient client, final int defaultExpirationSeconds) {
+		this(client, defaultExpirationSeconds, ObjectInputStream::new);
+	}
+
+	public ValkeyCacheService(
+			final BaseClient client,
+			final int defaultExpirationSeconds,
+			final ObjectInputStreamFactory objectInputStreamFactory) {
 		if (defaultExpirationSeconds <= 0) {
 			throw new IllegalArgumentException("defaultExpirationSeconds must be positive, got " + defaultExpirationSeconds);
 		}
 		this.client = client;
 		this.defaultExpirationSeconds = defaultExpirationSeconds;
+		this.objectInputStreamFactory = Objects.requireNonNull(objectInputStreamFactory, "objectInputStreamFactory");
 		this.defaultSetOptions = SetOptions.builder()
 				.expiry(SetOptions.Expiry.Seconds((long) defaultExpirationSeconds))
 				.build();
@@ -158,7 +193,7 @@ public class ValkeyCacheService implements MemcacheService {
 		return deflate(serialized);
 	}
 
-	private static Object fromCacheBytes(final byte[] bytes) {
+	private Object fromCacheBytes(final byte[] bytes) {
 		if (bytes == null || Arrays.equals(bytes, NULL_VALUE)) {
 			return null;
 		}
@@ -182,9 +217,9 @@ public class ValkeyCacheService implements MemcacheService {
 		}
 	}
 
-	private static Object deserialize(final byte[] serialized) {
+	private Object deserialize(final byte[] serialized) {
 		try (final ByteArrayInputStream bais = new ByteArrayInputStream(serialized);
-			 final ObjectInputStream ois = new ObjectInputStream(bais)) {
+			 final ObjectInputStream ois = objectInputStreamFactory.create(bais)) {
 			return ois.readObject();
 		} catch (final IOException | ClassNotFoundException e) {
 			throw new RuntimeException("Failed to deserialize cache value", e);
